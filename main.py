@@ -8,6 +8,7 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel
 from pypdf import PdfReader
+import time
 
 load_dotenv()
 
@@ -49,7 +50,7 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     return extracted_text.strip()
 
 
-def call_llm_extractor(raw_text: str) -> dict:
+def call_llm_extractor(raw_text: str, max_retries: int = 3) -> dict:
     prompt = f"""You are an automated invoice parsing engine.
 Extract the following fields from the invoice text below:
 - bill_no (string or null): The invoice/bill number or reference ID.
@@ -66,18 +67,23 @@ Invoice Text:
 {raw_text}
 """
 
-    response = client.models.generate_content(
-        model="gemini-3.6-flash",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            temperature=0.0,
-        ),
-    )
-
-    # Parse JSON safely
-    return json.loads(response.text)
-
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = client.models.generate_content(
+                model="gemini-3.6-flash",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.0,
+                ),
+            )
+            return json.loads(response.text)
+        except Exception as e:
+            # Retry on 503 capacity spikes with incremental backoff (2s, 4s)
+            if "503" in str(e) and attempt < max_retries:
+                time.sleep(2 * attempt)
+                continue
+            raise e
 
 @app.post("/extract", response_model=ExtractionResponse)
 async def extract_invoice(file: UploadFile = File(...)):
