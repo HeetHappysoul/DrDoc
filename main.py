@@ -1,23 +1,18 @@
 from datetime import datetime
 import io
-import json
 import os
 import sqlite3
-import time
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from google import genai
-from google.genai import types
-from pydantic import BaseModel
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_google_genai import ChatGoogleGenerativeAI
+from pydantic import BaseModel, Field
 from pypdf import PdfReader
 
 load_dotenv()
 
 app = FastAPI(title="DrDoc Extraction Service")
-
-# Initialize Gemini Client
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 # --- Database Setup (SQLite) ---
 DB_FILE = "invoices.db"
@@ -48,11 +43,26 @@ init_db()
 
 # --- Pydantic Schemas ---
 class InvoiceData(BaseModel):
-  bill_no: Optional[str] = None
-  date: Optional[str] = None
-  bill_to: Optional[str] = None
-  sold_by: Optional[str] = None
-  total_amount: Optional[float] = None
+  bill_no: Optional[str] = Field(
+      default=None,
+      description="The invoice or bill number / reference identifier.",
+  )
+  date: Optional[str] = Field(
+      default=None,
+      description="The date of the invoice (e.g. YYYY-MM-DD or standard date string).",
+  )
+  bill_to: Optional[str] = Field(
+      default=None,
+      description="The customer, client, or recipient organization/person.",
+  )
+  sold_by: Optional[str] = Field(
+      default=None,
+      description="The vendor, seller, or billing entity name and address.",
+  )
+  total_amount: Optional[float] = Field(
+      default=None,
+      description="The final total invoice amount as a numeric float.",
+  )
 
 
 class ReviewItem(BaseModel):
@@ -75,7 +85,37 @@ class ApprovalRequest(BaseModel):
   reviewer_status: str = "human_approved"
 
 
-# --- Extraction Functions ---
+# --- LangChain LCEL Setup ---
+# 1. Base Model
+llm = ChatGoogleGenerativeAI(
+    model="gemini-3.6-flash",
+    google_api_key=os.getenv("GEMINI_API_KEY"),
+    temperature=0.0,
+)
+
+# 2. Structured Output with Built-In Exponential Backoff Retries
+structured_llm = llm.with_structured_output(InvoiceData).with_retry(
+    stop_after_attempt=3
+)
+
+# 3. Prompt Template
+extraction_prompt = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        (
+            "You are an expert invoice parsing engine. Extract the required"
+            " fields with absolute precision. If any field is ambiguous or"
+            " absent, leave it as null. Do not invent details."
+        ),
+    ),
+    ("human", "Invoice Document Text:\n\n{raw_text}"),
+])
+
+# 4. Declarative Chain: Text -> Prompt -> Model -> Validated InvoiceData Object
+invoice_chain = extraction_prompt | structured_llm
+
+
+# --- PDF Parser ---
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
   pdf_file = io.BytesIO(pdf_bytes)
   reader = PdfReader(pdf_file)
@@ -84,40 +124,6 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     page_text = page.extract_text() or ""
     extracted_text += f"\n--- Page {page_num + 1} ---\n" + page_text
   return extracted_text.strip()
-
-
-def call_llm_extractor(raw_text: str, max_retries: int = 3) -> dict:
-  prompt = f"""You are an automated invoice parsing engine.
-Extract the following fields from the invoice text below:
-- bill_no (string or null): The invoice/bill number or reference ID.
-- date (string or null): The invoice date.
-- bill_to (string or null): The customer or recipient entity.
-- sold_by (string or null): The seller or vendor entity.
-- total_amount (number or null): The final total amount as a numeric float.
-
-Strict rules:
-1. Return ONLY a valid JSON object matching these keys.
-2. If any field is missing, unclear, or ambiguous, return null for that field. Do not invent or hallucinate data.
-
-Invoice Text:
-{raw_text}
-"""
-  for attempt in range(1, max_retries + 1):
-    try:
-      response = client.models.generate_content(
-          model="gemini-3.6-flash",
-          contents=prompt,
-          config=types.GenerateContentConfig(
-              response_mime_type="application/json",
-              temperature=0.0,
-          ),
-      )
-      return json.loads(response.text)
-    except Exception as e:
-      if "503" in str(e) and attempt < max_retries:
-        time.sleep(2 * attempt)
-        continue
-      raise e
 
 
 # --- API Routes ---
@@ -134,28 +140,14 @@ async def extract_invoice(file: UploadFile = File(...)):
             ReviewItem(
                 document_name=file.filename,
                 flagged_field="document_body",
-                reason=(
-                    "No readable digital text found in PDF (scanned image or"
-                    " empty file)."
-                ),
+                reason="No readable text found in PDF (empty or scanned image).",
             )
         ],
     )
 
   try:
-    extracted_dict = call_llm_extractor(raw_text)
-  except json.JSONDecodeError:
-    return ExtractionResponse(
-        status="error",
-        data=None,
-        review_queue=[
-            ReviewItem(
-                document_name=file.filename,
-                flagged_field="llm_output",
-                reason="LLM response was not valid JSON.",
-            )
-        ],
-    )
+    # Invoking the LCEL chain directly yields a populated InvoiceData object
+    invoice_data: InvoiceData = invoice_chain.invoke({"raw_text": raw_text})
   except Exception as e:
     return ExtractionResponse(
         status="error",
@@ -164,35 +156,26 @@ async def extract_invoice(file: UploadFile = File(...)):
             ReviewItem(
                 document_name=file.filename,
                 flagged_field="llm_service",
-                reason=f"LLM extraction call failed: {str(e)}",
+                reason=f"LangChain extraction failed: {str(e)}",
             )
         ],
     )
 
+  # Check for missing/null fields and route them to the human review queue
   review_queue: List[ReviewItem] = []
-  bill_no = extracted_dict.get("bill_no")
-
-  expected_fields = ["bill_no", "date", "bill_to", "sold_by", "total_amount"]
-  for field in expected_fields:
-    val = extracted_dict.get(field)
-    if val is None:
+  for field_name, value in invoice_data.model_dump().items():
+    if value is None:
       review_queue.append(
           ReviewItem(
-              bill_no=bill_no,
+              bill_no=invoice_data.bill_no,
               document_name=file.filename,
-              flagged_field=field,
+              flagged_field=field_name,
               extracted_value=None,
-              reason=f"Field '{field}' could not be extracted with certainty.",
+              reason=(
+                  f"Field '{field_name}' could not be extracted with certainty."
+              ),
           )
       )
-
-  invoice_data = InvoiceData(
-      bill_no=bill_no,
-      date=extracted_dict.get("date"),
-      bill_to=extracted_dict.get("bill_to"),
-      sold_by=extracted_dict.get("sold_by"),
-      total_amount=extracted_dict.get("total_amount"),
-  )
 
   return ExtractionResponse(
       status="success",
@@ -241,9 +224,7 @@ def list_invoices():
   conn = sqlite3.connect(DB_FILE)
   conn.row_factory = sqlite3.Row
   cursor = conn.cursor()
-  cursor.execute(
-      "SELECT * FROM approved_invoices ORDER BY created_at DESC"
-  )  #
+  cursor.execute("SELECT * FROM approved_invoices ORDER BY created_at DESC")
   rows = cursor.fetchall()
   conn.close()
   return [dict(row) for row in rows]
