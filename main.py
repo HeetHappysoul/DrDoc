@@ -9,6 +9,10 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
+
 
 load_dotenv()
 
@@ -19,23 +23,24 @@ DB_FILE = "invoices.db"
 
 
 def init_db():
-  conn = sqlite3.connect(DB_FILE)
-  cursor = conn.cursor()
-  cursor.execute("""
+    conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+    cursor = conn.cursor()
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS approved_invoices (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
             document_name TEXT NOT NULL,
             bill_no TEXT,
-            date TEXT,
-            sold_by TEXT,
+            bill_date TEXT,
             bill_to TEXT,
-            total_amount REAL,
-            reviewer_status TEXT DEFAULT 'human_approved',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
+            sold_by TEXT,
+            total_amount DOUBLE PRECISION,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
     """)
-  conn.commit()
-  conn.close()
+    conn.commit()
+    cursor.close()
+    conn.close()
 
 
 init_db()
@@ -80,9 +85,10 @@ class ExtractionResponse(BaseModel):
 
 
 class ApprovalRequest(BaseModel):
-  document_name: str
-  verified_data: InvoiceData
-  reviewer_status: str = "human_approved"
+    workspace_id: str
+    document_name: str
+    verified_data: InvoiceData
+    reviewer_status: str = "human_approved"
 
 
 # --- LangChain LCEL Setup ---
@@ -184,47 +190,62 @@ async def extract_invoice(file: UploadFile = File(...)):
   )
 
 
+# REPLACE your @app.post("/approve") function with this:
+
 @app.post("/approve")
 def approve_invoice(payload: ApprovalRequest):
-  """Stores human-verified invoice records into the audit database."""
-  try:
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute(
-        """
+    """Stores human-verified invoice records into the Postgres audit database."""
+    try:
+        conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+        cursor = conn.cursor()
+        cursor.execute(
+            """
             INSERT INTO approved_invoices 
-            (document_name, bill_no, date, sold_by, bill_to, total_amount, reviewer_status)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            payload.document_name,
-            payload.verified_data.bill_no,
-            payload.verified_data.date,
-            payload.verified_data.sold_by,
-            payload.verified_data.bill_to,
-            payload.verified_data.total_amount,
-            payload.reviewer_status,
-        ),
-    )
-    record_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
-    return {
-        "status": "stored",
-        "record_id": record_id,
-        "document_name": payload.document_name,
-    }
-  except Exception as e:
-    raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+            (workspace_id, document_name, bill_no, bill_date, sold_by, bill_to, total_amount)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING id;
+            """,
+            (
+                payload.workspace_id,
+                payload.document_name,
+                payload.verified_data.bill_no,
+                payload.verified_data.date,
+                payload.verified_data.sold_by,
+                payload.verified_data.bill_to,
+                payload.verified_data.total_amount,
+            ),
+        )
+        record_id = cursor.fetchone()[0]
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return {
+            "status": "stored",
+            "record_id": record_id,
+            "workspace_id": payload.workspace_id,
+            "document_name": payload.document_name,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 
 @app.get("/invoices")
-def list_invoices():
-  """Fetches all human-approved invoice records for reporting and auditing."""
-  conn = sqlite3.connect(DB_FILE)
-  conn.row_factory = sqlite3.Row
-  cursor = conn.cursor()
-  cursor.execute("SELECT * FROM approved_invoices ORDER BY created_at DESC")
-  rows = cursor.fetchall()
-  conn.close()
-  return [dict(row) for row in rows]
+def list_invoices(workspace_id: str):
+    """Fetches human-approved invoice records scoped strictly to the requesting workspace."""
+    try:
+        conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute(
+            """
+            SELECT * FROM approved_invoices 
+            WHERE workspace_id = %s 
+            ORDER BY created_at DESC;
+            """,
+            (workspace_id,),
+        )
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return rows
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
